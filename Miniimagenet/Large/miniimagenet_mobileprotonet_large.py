@@ -1,51 +1,24 @@
-# miniImageNet — Plain ProtoNet (MobileNetV3-Large backbone) — LOCAL/VS CODE VERSION
-# يشمل: حجمي الصورة 84x84 و 224x224، بدون LearnableNorm وبدون gamma
-# (ProtoNet قياسي: النموذج الأولي = متوسط سمات الدعم، والمسافة = Euclidean
-# التربيعية القياسية بدون أي معاملات تعلم إضافية)، مع تكرار التجربة على 3 seeds.
-# miniImageNet: 100 صنف (64 train / 16 val / 20 test) — تقسيم Ravi & Larochelle القياسي.
-#
-# ✅ FIX (هذه النسخة) — 3 إصلاحات لتوحيد السلوك مع باقي سكريباتنا (نفس
-#    المنطق اللي اتطبّق على نسخة MobileNetV3-Small):
-#   1) build_transforms: كل الدقات (بما فيها 84×84) بتعدي دلوقتي على نفس
-#      مسار resize→crop بنسبة هامش ثابتة (~12.5%)، بدل ما تكون 84px استثناء
-#      بـ resize مباشر بدون أي crop.
-#   2) batch_size أصبح متغيّر حسب الدقة (BATCH_SIZE_BY_RESOLUTION) بدل رقم
-#      ثابت 32 لكل الدقات — والقيم هنا مقلّلة عن نسخة Small لأن
-#      MobileNetV3-Large backbone أتقل في الذاكرة.
-#   3) تقسيم train/val/test أصبح بـ seed ثابت ومستقل (random.Random(42))
-#      بدل استخدام حالة random العامة غير المتحكم فيها.
-#
-# ✅ إضافة جديدة: نظام متابعة/استكمال (progress.json) — بيحفظ النتائج أول
-#    بأول، ولو التجربة اتقطعت وشغّلت الكود تاني، بيكمّل من عند آخر نقطة من
-#    غير ما يعيد أي تدريب أو تقييم خلص قبل كده.
-#
-# MATCHED-EPISODE EVALUATION:
-# بالإضافة للتقييم العشوائي المعتاد، نولّد مجموعة ثابتة من تعريفات الـ episodes
-# (نفس الأصناف + نفس صور الدعم/الاستعلام) مرة واحدة لكل k-shot، ونقيّم عليها
-# نموذجي 84x84 و224x224 (لكل seed). بما إن الـ episodes مطابقة تمامًا، الفرق
-# Δ_i = Acc224_i - Acc84_i لكل episode يصبح مقارنة "paired"، ونطبّق عليه
-# paired t-test و Wilcoxon signed-rank test لاختبار H0: E[Δ] = 0.
 
 import os
 import json
 try:
     import kagglehub
 except ImportError:
-    print("📦 Installing kagglehub...")
+    print(" Installing kagglehub...")
     os.system('pip install -q kagglehub')
     import kagglehub
 
 try:
     from thop import profile as thop_profile
 except ImportError:
-    print("📦 Installing thop...")
+    print(" Installing thop...")
     os.system('pip install -q thop')
     from thop import profile as thop_profile
 
 try:
     from scipy import stats as scipy_stats
 except ImportError:
-    print("📦 Installing scipy...")
+    print(" Installing scipy...")
     os.system('pip install -q scipy')
     from scipy import stats as scipy_stats
 
@@ -62,19 +35,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from PIL import Image
 
-# ============================================
-# 0. LOCAL PATHS
-# ============================================
-# غيّر ده لو اسم الداتاست بتاعك على Kaggle مختلف.
+
 MINI_KAGGLEHUB_ID = "arjunashok33/miniimagenet"  # عدّله لو مختلف عندك
 
 WORK_ROOT       = os.path.join(os.getcwd(), "miniimagenet_workdir")
 MINI_SPLIT_ROOT = os.path.join(WORK_ROOT, "miniimagenet_split")
 os.makedirs(WORK_ROOT, exist_ok=True)
 
-# ============================================
-# 1. SETUP
-# ============================================
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -85,9 +53,9 @@ def set_seed(seed=42):
         torch.backends.cudnn.benchmark = False
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🔥 Processing on: {device}")
+print(f" Processing on: {device}")
 
-# Simple stage-timing registry
+
 STAGE_TIMES = {}
 
 class StageTimer:
@@ -97,14 +65,14 @@ class StageTimer:
 
     def __enter__(self):
         self.t0 = time.time()
-        print(f"\n⏱️  [{self.name}] started...")
+        print(f"\n  [{self.name}] started...")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         elapsed = time.time() - self.t0
         STAGE_TIMES[self.name] = elapsed
         mins = elapsed / 60.0
-        print(f"⏱️  [{self.name}] finished in {elapsed:.1f}s ({mins:.2f} min)")
+        print(f"  [{self.name}] finished in {elapsed:.1f}s ({mins:.2f} min)")
 
 
 def print_stage_time_summary():
@@ -112,7 +80,7 @@ def print_stage_time_summary():
         print("No stage timings recorded yet.")
         return
     print("\n" + "="*40)
-    print("⏱️  STAGE TIME SUMMARY")
+    print("  STAGE TIME SUMMARY")
     print("="*40)
     total = 0.0
     for name, secs in STAGE_TIMES.items():
@@ -120,9 +88,7 @@ def print_stage_time_summary():
         total += secs
     print(f"  {'TOTAL':45s} {total:8.1f}s  ({total/60:.2f} min)")
 
-# ============================================
-# 2. MODEL PROFILING: PARAMETERS & FLOPs
-# ============================================
+
 
 def count_parameters(model, trainable_only=False):
     if trainable_only:
@@ -151,7 +117,7 @@ def compute_flops(backbone_module, input_size, device=device):
 
     gflops = macs / 1e9
     params_m = params / 1e6
-    print(f"📐 Backbone profile @ {input_size}x{input_size}: "
+    print(f" Backbone profile @ {input_size}x{input_size}: "
           f"{params_m:.2f}M params | {gflops:.4f} GFLOPs (MACs)")
     return {"params": params, "params_M": params_m, "macs": macs, "gflops": gflops}
 
@@ -160,7 +126,7 @@ def report_full_model_stats(model, input_size):
     """Total params of ProtoNet wrapper (backbone only, no extra params) + FLOPs."""
     total_params = count_parameters(model)
     trainable_params = count_parameters(model, trainable_only=True)
-    print(f"\n📊 ProtoNet full model: "
+    print(f"\n ProtoNet full model: "
           f"{total_params/1e6:.3f}M total params | "
           f"{trainable_params/1e6:.3f}M trainable params")
     flops_info = compute_flops(model.backbone, input_size=input_size)
@@ -170,11 +136,7 @@ def report_full_model_stats(model, input_size):
         **flops_info
     }
 
-# ============================================
-# 3. DATA PREPARATION — miniImageNet (auto-download via kagglehub)
-# ============================================
-# miniImageNet: 100 classes sampled from ImageNet, 600 images/class.
-# Standard split (Ravi & Larochelle 2017): 64 train / 16 val / 20 test classes.
+
 
 def _find_class_dirs(root):
     """Return a directory whose immediate children are all class-folders
@@ -195,17 +157,17 @@ def _find_class_dirs(root):
 
 def prepare_miniimagenet():
     if os.path.exists(MINI_SPLIT_ROOT):
-        print("✅ miniImageNet split already present.")
+        print(" miniImageNet split already present.")
         return
 
-    print("\n📥 Downloading miniImageNet...")
+    print("\n Downloading miniImageNet...")
     try:
-        # ملحوظة: عدّل اسم الداتاست هنا لو الـ id مختلف عندك على Kaggle.
+       
         path = kagglehub.dataset_download(MINI_KAGGLEHUB_ID)
         dataset_path = path
-        print(f"📁 Dataset downloaded to: {dataset_path}")
+        print(f" Dataset downloaded to: {dataset_path}")
 
-        # الحالة 1: الداتاست موزّع بالفعل بمجلدات train/val/test رسمية
+        
         existing_splits = {}
         for split_name in ["train", "val", "test"]:
             for r, dirs, files in os.walk(dataset_path):
@@ -216,15 +178,14 @@ def prepare_miniimagenet():
         os.makedirs(MINI_SPLIT_ROOT, exist_ok=True)
 
         if len(existing_splits) == 3:
-            print("📦 Found official train/val/test split folders.")
+            print(" Found official train/val/test split folders.")
             for split_name, src_root in existing_splits.items():
                 dst_root = os.path.join(MINI_SPLIT_ROOT, split_name)
                 if not os.path.exists(dst_root):
                     shutil.copytree(src_root, dst_root)
-            print("✅ miniImageNet Data Structure Ready! (official 64/16/20 split)")
+            print(" miniImageNet Data Structure Ready! (official 64/16/20 split)")
             return
 
-        # الحالة 2: مجلد واحد فيه كل الأصناف (100 مجلد) → نعمل تقسيم يدوي 64/16/20
         images_root = _find_class_dirs(dataset_path)
         if images_root is None:
             raise RuntimeError("Could not locate miniImageNet class directories in download.")
@@ -234,9 +195,8 @@ def prepare_miniimagenet():
                            if os.path.isdir(os.path.join(images_root, d))])
         print(f"📦 Found {len(classes)} classes.")
 
-        rng = random.Random(42)  # seed ثابت ومستقل عن حالة random العامة —
-                                  # عشان الـ split يتكرر بنفس الشكل بين
-                                  # الجلسات، ويطابق باقي سكريباتنا.
+        rng = random.Random(42)  
+                                 
         rng.shuffle(classes)
         splits = {
             "train": classes[:64],
@@ -251,28 +211,23 @@ def prepare_miniimagenet():
                 dst = os.path.join(MINI_SPLIT_ROOT, split_name, c)
                 if not os.path.exists(dst):
                     shutil.copytree(src, dst)
-        print("✅ miniImageNet Data Structure Ready! (64/16/20 split)")
+        print(" miniImageNet Data Structure Ready! (64/16/20 split)")
     except Exception as e:
-        print(f"❌ Error downloading/preparing miniImageNet: {e}")
+        print(f" Error downloading/preparing miniImageNet: {e}")
 
 
 with StageTimer("Stage 0: Data Preparation (miniImageNet)"):
     prepare_miniimagenet()
 
-# ============================================
-# 4. PROTOTYPE (Plain ProtoNet — no learnable norm, no gamma)
-# ============================================
+
 
 def compute_prototype(z_support):
     """Class prototype = arithmetic mean of raw support embeddings."""
     return z_support.mean(dim=0)
 
-# ============================================
-# 5. MODEL DEFINITION — MobileNetV3-LARGE
-# ============================================
 
 def get_mobilenet_finetuned(num_classes=64, supervised=True):
-    print(f"🔄 Loading MobileNetV3-LARGE (num_classes={num_classes})...")
+    print(f" Loading MobileNetV3-LARGE (num_classes={num_classes})...")
     weights = models.MobileNet_V3_Large_Weights.DEFAULT
     model   = models.mobilenet_v3_large(weights=weights)
 
@@ -292,17 +247,12 @@ def build_protonet_for_inference(checkpoint_path, num_classes=64):
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.to(device)
     model.eval()
-    print(f"✅ Loaded checkpoint: {checkpoint_path}")
+    print(f" Loaded checkpoint: {checkpoint_path}")
     return model
 
 
 class MobileProtoNet(nn.Module):
-    """
-    Plain ProtoNet: prototype = mean of support embeddings,
-    logits = -squared_euclidean_distance(query, prototype).
-    لا يوجد LearnableNorm ولا gamma (بدون أي معاملات إضافية قابلة للتعلم
-    خارج الـ backbone نفسه).
-    """
+   
     def __init__(self, backbone):
         super().__init__()
         self.backbone = backbone
@@ -325,13 +275,6 @@ class MobileProtoNet(nn.Module):
         dists = torch.cdist(z_query, z_proto) ** 2
         logits = -dists
         return logits
-
-# ============================================
-# 6. DATA LOADERS (parametrized by input_size)
-# ============================================
-# ✅ موحّدة مع باقي سكريباتنا: كل الدقات (بما فيها 84×84) بتعدي على نفس
-# مسار resize→crop بنسبة هامش ثابتة (~12.5%: resize_dim = crop_dim × 256/224)،
-# عشان شدة augmentation تفضل متساوية بين كل الدقات وتبقى المقارنة عادلة.
 
 def get_resize_dim(crop_dim):
     return round(crop_dim * 256 / 224)
@@ -359,10 +302,6 @@ def build_transforms(input_size):
 
 MINI_ROOT = MINI_SPLIT_ROOT
 
-# batch size أقل عند الدقات الكبيرة عشان نتجنب overflow في VRAM. القيم دي
-# مقلّلة عن نسخة Small (تقريبًا للنصف) لأن MobileNetV3-Large backbone أتقل
-# في الذاكرة (~5.4M params وFLOPs أعلى بشكل ملحوظ من Small). القيم تقديرية
-# — لو حصل CUDA Out Of Memory قلّلها أكتر حسب الـ GPU المتاح فعليًا.
 BATCH_SIZE_BY_RESOLUTION = {84: 32, 112: 24, 168: 16, 224: 16, 256: 8}
 
 
@@ -405,17 +344,10 @@ class EpisodicSampler:
                 torch.stack(query_imgs),
                 torch.tensor(query_labels))
 
-# ============================================
-# 6b. MATCHED-EPISODE EVALUATION (fixed episode set)
-# ============================================
-# نولّد تعريفات الـ episodes (أصناف + مسارات صور الدعم/الاستعلام فقط، بدون
-# تحميل الصور) مرة واحدة باستخدام RNG محلي منفصل عن الـ random العام، حتى
-# لا تتأثر بأي seeding آخر في الكود. بعدين نفس التعريفات بتتحمّل وبتتحوّل
-# بـ transform كل دقة صورة على حدة عند التقييم، فتبقى المقارنة "matched"
-# تمامًا: نفس الأصناف ونفس الصور بالظبط لكل دقة.
+
 
 def generate_fixed_episodes(root, n_way, k_shot, q_query, n_episodes, seed):
-    rng = random.Random(seed)  # RNG محلي مستقل — لا يمس حالة random العامة
+    rng = random.Random(seed)  
     classes = sorted(os.listdir(root))
     data = {}
     for c in classes:
@@ -464,9 +396,7 @@ def _load_episode_tensors(episode_def, transform, n_way, k_shot):
 
 @torch.no_grad()
 def evaluate_fixed_episodes(model, episode_defs, transform, n_way, k_shot, desc=""):
-    """يقيّم موديل على مجموعة episodes ثابتة (paths محددة سلفًا) ويرجّع
-    مصفوفة دقة لكل episode على حدة (بدون تجميع)، عشان تُستخدم في اختبار
-    paired لاحقًا."""
+    
     model.eval()
     accs = []
     for ep_def in tqdm(episode_defs, desc=f"Matched-Eval {desc}", leave=False):
@@ -479,8 +409,7 @@ def evaluate_fixed_episodes(model, episode_defs, transform, n_way, k_shot, desc=
 
 
 def paired_resolution_test(acc_84, acc_224, label=""):
-    """اختبار paired بين نفس الـ episodes بدقتين مختلفتين.
-    Δ_i = Acc224_i - Acc84_i ، H0: E[Δ] = 0."""
+    
     assert len(acc_84) == len(acc_224), "عدد الـ episodes لازم يتطابق للمقارنة الـ paired"
     delta = acc_224 - acc_84
     mean_delta = delta.mean()
@@ -496,7 +425,7 @@ def paired_resolution_test(acc_84, acc_224, label=""):
         # Wilcoxon بيفشل لو كل الفروق = صفر
         w_stat, w_pval = float('nan'), float('nan')
 
-    print(f"\n📈 Paired 84x84 vs 224x224 — {label}")
+    print(f"\n Paired 84x84 vs 224x224 — {label}")
     print(f"   n episodes        : {n}")
     print(f"   Mean Acc @84       : {acc_84.mean():.2%}")
     print(f"   Mean Acc @224      : {acc_224.mean():.2%}")
@@ -516,9 +445,6 @@ def paired_resolution_test(acc_84, acc_224, label=""):
         "acc_224_mean": acc_224.mean(),
     }
 
-# ============================================
-# 7. EXECUTION STAGES
-# ============================================
 
 def stage1_finetuning(train_loader_simple, epochs=10, num_classes=64):
     print(f"\n🦾 STAGE 1: Fine-tuning MobileNet on miniImageNet for {epochs} epochs...")
@@ -552,14 +478,14 @@ def stage1_finetuning(train_loader_simple, epochs=10, num_classes=64):
         print(f"   Ep {epoch+1}: Loss {total_loss/len(train_loader_simple):.4f} | "
               f"Train Acc {correct/total:.2%}")
 
-    print("✅ Fine-tuning Complete.")
+    print(" Fine-tuning Complete.")
     return model
 
 
 def stage2_metatrain(pretrained_state_dict, train_sampler, val_sampler,
                       n_way=5, k_shot=1, episodes=2000, num_classes=64,
                       ckpt_path="best_mobile_proto_miniimagenet.pth"):
-    print(f"\n🧠 STAGE 2: Meta-Training (ProtoNet) on miniImageNet "
+    print(f"\n STAGE 2: Meta-Training (ProtoNet) on miniImageNet "
           f"{n_way}-way {k_shot}-shot...")
 
     base_model = get_mobilenet_finetuned(num_classes=num_classes, supervised=True)
@@ -568,7 +494,6 @@ def stage2_metatrain(pretrained_state_dict, train_sampler, val_sampler,
 
     model = MobileProtoNet(base_model).to(device)
 
-    # لا يوجد learnable_norm أو gamma الآن، لذلك مجموعة معاملات واحدة فقط للـ backbone
     optimizer = torch.optim.Adam(model.backbone.parameters(), lr=1e-5)
     criterion = nn.CrossEntropyLoss()
 
@@ -598,7 +523,7 @@ def stage2_metatrain(pretrained_state_dict, train_sampler, val_sampler,
             else:
                 patience += 1
                 if patience > 10:
-                    print("⏹️ Early stopping triggered.")
+                    print(" Early stopping triggered.")
                     break
 
     return model
@@ -622,13 +547,9 @@ def evaluate(model, sampler, n_way, k_shot, episodes=500, silent=False):
     ci95     = 1.96 * np.std(accs) / np.sqrt(episodes)
 
     if not silent:
-        print(f"📊 Result: {mean_acc:.2%} ± {ci95:.2%}")
+        print(f" Result: {mean_acc:.2%} ± {ci95:.2%}")
 
     return mean_acc, ci95
-
-# ============================================
-# 8. RUN ONE FULL EXPERIMENT (given input_size + seed)
-# ============================================
 
 NUM_TRAIN_CLASSES = 64  # miniImageNet train split size
 
@@ -661,7 +582,7 @@ def run_experiment(input_size, seed, epochs=10, episodes=2000):
 
     tag = f"{input_size}px_seed{seed}"
 
-    # ── Stage 1 ──────────────────────────────
+   
     backbone_ckpt = os.path.join(WORK_ROOT, f"backbone_pretrained_miniimagenet_{tag}.pth")
     if not os.path.exists(backbone_ckpt):
         with StageTimer(f"Stage 1: Fine-Tuning ({tag})"):
@@ -669,14 +590,14 @@ def run_experiment(input_size, seed, epochs=10, episodes=2000):
                                           num_classes=NUM_TRAIN_CLASSES)
             torch.save(ft_model.state_dict(), backbone_ckpt)
     else:
-        print(f"✅ Pre-trained backbone found for {tag}. Skipping Stage 1.")
+        print(f" Pre-trained backbone found for {tag}. Skipping Stage 1.")
     pretrained_state_dict = torch.load(backbone_ckpt, map_location=device)
 
     results = {}
 
     for k_shot in [1, 5]:
         print("\n" + "="*40)
-        print(f"🎯 TASK: 5-way {k_shot}-shot ({tag})")
+        print(f" TASK: 5-way {k_shot}-shot ({tag})")
         print("="*40)
 
         ckpt_path = os.path.join(
@@ -697,29 +618,18 @@ def run_experiment(input_size, seed, epochs=10, episodes=2000):
 
         if k_shot == 5:
             print("\n" + "="*40)
-            print(f"📐 MODEL SIZE & COMPUTE REPORT ({tag})")
+            print(f" MODEL SIZE & COMPUTE REPORT ({tag})")
             print("="*40)
             report_full_model_stats(best_model, input_size=input_size)
 
     return results
 
-# ============================================
-# 8b. RESUME / PROGRESS TRACKING
-# ============================================
-# ملف تقدّم بيتحدّث بعد كل (input_size, seed, k_shot) يخلص — لو التجربة
-# اتقطعت (انقطع النت، قفلت الجلسة، ...) وشغّلت الكود تاني، هيقرأ الملف ده
-# ويكمّل من عند آخر حاجة خلصها، من غير ما يعيد أي تدريب أو تقييم اتعمل قبل
-# كده. الحفظ atomic (كتابة لملف مؤقت ثم rename) عشان لو الجلسة اتقفلت في
-# نص الكتابة، الملف الأصلي يفضل سليم.
 
 PROGRESS_FILE = os.path.join(WORK_ROOT, "progress.json")
 
 
 def load_progress():
-    """يرجّع (all_results, matched_accs) من ملف التقدّم لو موجود، وإلا
-    قواميس فاضية. all_results بنفس شكل المتغيّر all_results في MAIN.
-    matched_accs بنفس شكل matched_accs (مصفوفات per-episode لكل
-    k_shot/seed/input_size، مستخدمة في الـ Matched-Episode Evaluation)."""
+    
     if not os.path.exists(PROGRESS_FILE):
         return {}, {}
     try:
@@ -755,7 +665,7 @@ def load_progress():
             }
 
     if all_results or matched_accs:
-        print(f"\n♻️  لقينا تقدّم سابق في {PROGRESS_FILE}:")
+        print(f"\n  لقينا تقدّم سابق في {PROGRESS_FILE}:")
         for res, seeds in all_results.items():
             print(f"    {res}px: seeds خلّصت = {sorted(seeds.keys())}")
         for k_shot, seeds in matched_accs.items():
@@ -765,7 +675,7 @@ def load_progress():
 
 
 def save_progress(all_results, matched_accs):
-    """يحفظ التقدّم الحالي بطريقة atomic (كتابة لملف مؤقت ثم rename)."""
+    
     report = {
         "results": {
             str(res): {
@@ -795,11 +705,8 @@ def save_progress(all_results, matched_accs):
     tmp_path = PROGRESS_FILE + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(report, f, indent=2)
-    os.replace(tmp_path, PROGRESS_FILE)  # rename ذرّي — إما ينجح كامل أو مايحصلش خالص
+    os.replace(tmp_path, PROGRESS_FILE)  
 
-# ============================================
-# 9. MAIN — LOOP OVER INPUT SIZES × 3 SEEDS
-# ============================================
 
 if __name__ == "__main__":
     INPUT_SIZES = [84, 224]
@@ -820,16 +727,16 @@ if __name__ == "__main__":
                 and 5 in all_results[input_size][seed]
             )
             if already_done:
-                print(f"✅ {input_size}px seed={seed} موجود في التقدّم المحفوظ — تخطّي.")
+                print(f" {input_size}px seed={seed} موجود في التقدّم المحفوظ — تخطّي.")
                 continue
 
             res = run_experiment(input_size, seed, epochs=10, episodes=2000)
             all_results[input_size][seed] = res
-            save_progress(all_results, matched_accs)  # حفظ فوري بعد كل seed
+            save_progress(all_results, matched_accs)  
 
-    # ── ملخص النتائج عبر الـ 3 seeds ──────────
+   
     print("\n" + "="*60)
-    print("📊 FINAL SUMMARY — MEAN ± STD OVER 3 SEEDS")
+    print(" FINAL SUMMARY — MEAN ± STD OVER 3 SEEDS")
     print("="*60)
     for input_size in INPUT_SIZES:
         for k_shot in [1, 5]:
@@ -838,16 +745,9 @@ if __name__ == "__main__":
                   f"{np.mean(accs):.2%} ± {np.std(accs):.2%}  "
                   f"(runs: {[f'{a:.2%}' for a in accs]})")
 
-    # ============================================
-    # MATCHED-EPISODE EVALUATION (84x84 vs 224x224)
-    # ============================================
-    # نولّد مجموعة episodes ثابتة (نفس الأصناف ونفس صور الدعم/الاستعلام)
-    # مرة واحدة لكل k-shot، مستقلة عن seeds التدريب، ونعيد استخدامها مع
-    # كل الـ seeds. المقارنة بين 84x84 و224x224 على نفس الـ episodes
-    # بالظبط تحوّلها لمقارنة paired أقوى إحصائيًا من مقارنة متوسطين من
-    # مجموعتين مختلفتين من episodes عشوائية.
+   
     print("\n" + "="*60)
-    print("📈 MATCHED-EPISODE EVALUATION (paired 84x84 vs 224x224)")
+    print(" MATCHED-EPISODE EVALUATION (paired 84x84 vs 224x224)")
     print("="*60)
 
     with StageTimer("Stage 4: Matched-Episode Generation"):
@@ -870,7 +770,7 @@ if __name__ == "__main__":
 
             for seed in SEEDS:
                 if seed in matched_accs[k_shot]:
-                    print(f"✅ Matched-Eval {k_shot}-shot seed={seed} "
+                    print(f" Matched-Eval {k_shot}-shot seed={seed} "
                           f"موجود في التقدّم المحفوظ — تخطّي.")
                     continue
 
@@ -891,8 +791,7 @@ if __name__ == "__main__":
                 paired_resolution_test(acc_84, acc_224,
                                         label=f"{k_shot}-shot, seed={seed}")
 
-            # ── تجميع كل الـ seeds مع بعض (نفس الـ episodes الثابتة مُعادة الاستخدام
-            #    مع كل seed، فالـ pairing يفضل صحيح لكل عنصر) ──
+            
             pooled_84  = np.concatenate([matched_accs[k_shot][s][84]  for s in SEEDS])
             pooled_224 = np.concatenate([matched_accs[k_shot][s][224] for s in SEEDS])
             paired_resolution_test(pooled_84, pooled_224,
@@ -900,4 +799,4 @@ if __name__ == "__main__":
                                           f"({N_MATCHED_EPISODES} episodes × {len(SEEDS)} seeds)")
 
     print_stage_time_summary()
-    print(f"\n💾 التقدّم والنتائج محفوظة في: {PROGRESS_FILE}")
+    print(f"\n التقدّم والنتائج محفوظة في: {PROGRESS_FILE}")
