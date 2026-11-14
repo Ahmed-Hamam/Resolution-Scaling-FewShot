@@ -1,0 +1,1144 @@
+# CUB-200-2011 — MobileNetV3-SMALL (ImageNet-pretrained) — 4-WAY FRESH TRAINING — KAGGLE + GITHUB
+# ============================================================================
+# بيدرّب (Stage 1 + Stage 2 كاملين) أربع حالات على نفس الـ seed، ويقيّمهم على نفس
+# الـ 2000 matched episodes:
+#   (1) 84px   : Resize 96 → crop 84, batch 64
+#   (2) 84b32  : نفس (1) لكن batch 32 (بيعزل أثر الـ batch)
+#   (3) 84up224: Resize 96 → crop 84 → تكبير bilinear لـ 224, batch 32
+#   (4) 224px  : Resize 256 → crop 224, batch 32
+# ⚠️ مفيش أي نتيجة قديمة بتتستخدم: كل الحالات بتتدرّب هنا. الاستمرارية بس من
+# progress_3way.json + checkpoints اللي الكود نفسه بيعملها (على GitHub).
+# الـ backbone: MobileNetV3-Small بأوزان ImageNet الجاهزة (Stage 1: 10 epochs).
+#
+# على Kaggle: ضيف داتاست CUB-200-2011 كـ Input، فعّل GPU وInternet، وضيف Secret باسم
+# GITHUB_TOKEN (Add-ons → Secrets).
+# ============================================================================
+
+import os
+import json
+import glob
+import shutil
+import subprocess
+
+try:
+    import kagglehub
+except ImportError:
+    print("📦 Installing kagglehub...")
+    os.system("pip install -q kagglehub")
+    import kagglehub
+
+
+def _get_github_token():
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        return tok
+    try:
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret("GITHUB_TOKEN")
+    except Exception:
+        return None
+
+
+try:
+    from thop import profile as thop_profile
+except ImportError:
+    print("📦 Installing thop...")
+    os.system('pip install -q thop')
+    from thop import profile as thop_profile
+
+try:
+    from scipy import stats as scipy_stats
+except ImportError:
+    print("📦 Installing scipy...")
+    os.system('pip install -q scipy')
+    from scipy import stats as scipy_stats
+
+import time
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from PIL import Image
+
+# ============================================
+# 0. PATHS (Kaggle: input للداتاست، working للتدريب/الحفظ)
+# ============================================
+# الداتاست: من /kaggle/input مباشرة (مفيش تنزيل خالص)
+KAGGLE_INPUT_ROOT = "/kaggle/input"
+CUB_KAGGLEHUB_ID  = "wenewone/cub2002011"        # عدّله لو داتاست CUB عندك مختلف
+
+# مكان العمل: /kaggle/working (بيتحفظ لما تعمل Save Version)
+WORK_ROOT      = "/kaggle/working/cub200_small_3way_workdir"
+DATA_ROOT      = "/kaggle/working/cub200_data_local"
+CUB_SPLIT_ROOT = os.path.join(DATA_ROOT, "cub200_split")
+os.makedirs(WORK_ROOT, exist_ok=True)
+os.makedirs(DATA_ROOT, exist_ok=True)
+
+print(f"📂 WORK_ROOT (progress + checkpoints, بيتحفظ مع Save Version) = {WORK_ROOT}")
+
+# 🆕 إعداد GitHub Auto-Push — غيّر القيمة دي لاسم مستودعك (username/reponame)
+GITHUB_REPO       = "Ahmed-Hamam/control84up224"
+GITHUB_BRANCH     = "main"
+GITHUB_CLONE_DIR  = "/kaggle/working/_github_results_repo"
+GITHUB_SUBFOLDER  = "control84up224_results"  # المجلد جوه المستودع اللي هتتحط فيه الملفات
+PROGRESS_NAME     = "progress_3way.json"        # ملف التقدّم الوحيد (بيتكتب ويتسترجع من GitHub)
+
+
+def _run_git_cmd(args, cwd=None, env=None):
+    """ينفّذ أمر git ويرجّع (success, output). بيلتقط stderr/stdout في
+    الرسالة نفسها عشان نقدر نطبع سبب الفشل لو حصل. (معرّفة هنا فوق عشان
+    تُستخدم في الاسترجاع التلقائي من GitHub بالأول، وكمان في push_results_to_github تحت)."""
+    result = subprocess.run(
+        ["git"] + args, cwd=cwd, env=env,
+        capture_output=True, text=True
+    )
+    ok = (result.returncode == 0)
+    output = (result.stdout or "") + (result.stderr or "")
+    return ok, output
+
+
+def _restore_previous_workdir_from_input():
+    """🆕 يدوّر في /kaggle/input على أي مجلد مضاف فيه progress.json (يعني
+    ده Output بتاع نسخة سابقة من نفس النوتبوك أُضيف كـ Input)، ولو لقاه
+    بينسخ كل محتوياته لـ WORK_ROOT محليًا (نسخ محلي سريع، مش عبر الشبكة)
+    عشان الـ Resume يشتغل عادي."""
+    if os.path.exists(os.path.join(WORK_ROOT, PROGRESS_NAME)):
+        print("✅ progress.json موجود بالفعل في WORK_ROOT — مفيش حاجة نسترجعها.")
+        return
+
+    candidates = glob.glob(os.path.join(KAGGLE_INPUT_ROOT, "*", "**", PROGRESS_NAME),
+                            recursive=True)
+    if not candidates:
+        print("ℹ️  مفيش نسخة سابقة (progress.json) موجودة في أي Input — هنبدأ من الصفر.")
+        return
+
+    # لو فيه أكتر من واحد (مش متوقع)، ناخد أحدث واحد بالـ mtime
+    src_progress = max(candidates, key=os.path.getmtime)
+    src_dir = os.path.dirname(src_progress)
+    print(f"♻️  لقينا نسخة سابقة في: {src_dir}")
+    print("📦 بننسخ progress.json وكل الـ checkpoints لـ WORK_ROOT محليًا...")
+
+    for item in os.listdir(src_dir):
+        src_path = os.path.join(src_dir, item)
+        dst_path = os.path.join(WORK_ROOT, item)
+        if os.path.isfile(src_path) and not os.path.exists(dst_path):
+            shutil.copy2(src_path, dst_path)
+
+    print(f"✅ تم استرجاع {len(os.listdir(WORK_ROOT))} ملف من النسخة السابقة.")
+
+
+def _restore_previous_workdir_from_github():
+    """يسحب progress + كل الـ checkpoints من GitHub لـ WORK_ROOT (بيجرّب GITHUB_SUBFOLDER،
+    ولو مفيهوش بيدوّر في المستودع كله ويطبع اللي لقاه). بيشتغل من غير token لو المستودع Public."""
+    if os.path.exists(os.path.join(WORK_ROOT, PROGRESS_NAME)):
+        return
+
+    token = _get_github_token()
+    if not token:
+        print("ℹ️  مقدرتش أجيب GITHUB_TOKEN (Kaggle Secrets) — هجرّب clone من غير token (Public بس).")
+
+    print(f"\n🔍 بنحاول نسترجع نسخة سابقة من مستودع GitHub ({GITHUB_REPO})...")
+    remote_url = (f"https://{token}@github.com/{GITHUB_REPO}.git" if token
+                  else f"https://github.com/{GITHUB_REPO}.git")
+    try:
+        if not os.path.exists(os.path.join(GITHUB_CLONE_DIR, ".git")):
+            ok, out = _run_git_cmd(["clone", "--depth", "1", "--branch", GITHUB_BRANCH,
+                                     remote_url, GITHUB_CLONE_DIR])
+            if not ok:
+                shutil.rmtree(GITHUB_CLONE_DIR, ignore_errors=True)
+                ok, out = _run_git_cmd(["clone", "--depth", "1", remote_url, GITHUB_CLONE_DIR])
+            if not ok:
+                print("ℹ️  مقدرناش نعمل clone (المستودع فاضي/الاسم غلط/Internet مقفول؟) — هنبدأ من الصفر.\n"
+                      + out.replace(token or "@@", "***"))
+                return
+        else:
+            _run_git_cmd(["pull", "--rebase", "origin", GITHUB_BRANCH], cwd=GITHUB_CLONE_DIR)
+
+        src_dir = os.path.join(GITHUB_CLONE_DIR, GITHUB_SUBFOLDER)
+        if not os.path.exists(os.path.join(src_dir, PROGRESS_NAME)):
+            found = [p for p in glob.glob(os.path.join(GITHUB_CLONE_DIR, "**", "progress*.json"), recursive=True)
+                     if os.sep + ".git" + os.sep not in p]
+            print(f"ℹ️  مفيش {PROGRESS_NAME} في '{GITHUB_SUBFOLDER}' — هنبدأ من الصفر. موجود في المستودع:",
+                  [os.path.relpath(p, GITHUB_CLONE_DIR) for p in found] or "(مفيش)")
+            return
+
+        print(f"♻️  لقينا نسخة سابقة على GitHub في {src_dir}")
+        n = 0
+        for item in os.listdir(src_dir):
+            sp = os.path.join(src_dir, item); dp = os.path.join(WORK_ROOT, item)
+            if os.path.isfile(sp) and not os.path.exists(dp):
+                shutil.copy2(sp, dp); n += 1
+        print(f"✅ تم استرجاع {n} ملف من GitHub — هيكمّل من آخر حالة اتسجّلت.")
+    except Exception as e:
+        print(f"⚠️  الاسترجاع من GitHub فشل ({e}) — هنبدأ من الصفر.")
+
+
+_restore_previous_workdir_from_input()
+_restore_previous_workdir_from_github()
+
+# ============================================
+# 1. SETUP
+# ============================================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🔥 Processing on: {device}")
+
+STAGE_TIMES = {}
+
+class StageTimer:
+    """Context manager that records wall-clock time for a named stage."""
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.t0 = time.time()
+        print(f"\n⏱️  [{self.name}] started...")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self.t0
+        STAGE_TIMES[self.name] = elapsed
+        mins = elapsed / 60.0
+        print(f"⏱️  [{self.name}] finished in {elapsed:.1f}s ({mins:.2f} min)")
+
+
+def print_stage_time_summary():
+    if not STAGE_TIMES:
+        print("No stage timings recorded yet.")
+        return
+    print("\n" + "="*40)
+    print("⏱️  STAGE TIME SUMMARY")
+    print("="*40)
+    total = 0.0
+    for name, secs in STAGE_TIMES.items():
+        print(f"  {name:45s} {secs:8.1f}s  ({secs/60:.2f} min)")
+        total += secs
+    print(f"  {'TOTAL':45s} {total:8.1f}s  ({total/60:.2f} min)")
+
+# ============================================
+# 2. MODEL PROFILING: PARAMETERS & FLOPs
+# ============================================
+
+def count_parameters(model, trainable_only=False):
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
+
+
+def compute_flops(backbone_module, input_size, device=device):
+    """Backbone-only FLOPs/params via thop (feature extraction pass only)."""
+    backbone_module = backbone_module.to(device).eval()
+    dummy = torch.randn(1, 3, input_size, input_size).to(device)
+
+    class _FeatureOnly(nn.Module):
+        def __init__(self, backbone):
+            super().__init__()
+            self.backbone = backbone
+
+        def forward(self, x):
+            x = self.backbone.features(x)
+            x = self.backbone.avgpool(x)
+            return torch.flatten(x, 1)
+
+    wrapper = _FeatureOnly(backbone_module).to(device).eval()
+    with torch.no_grad():
+        macs, params = thop_profile(wrapper, inputs=(dummy,), verbose=False)
+
+    gflops = macs / 1e9
+    params_m = params / 1e6
+    print(f"📐 Backbone profile @ {input_size}x{input_size}: "
+          f"{params_m:.2f}M params | {gflops:.4f} GFLOPs (MACs)")
+    return {"params": params, "params_M": params_m, "macs": macs, "gflops": gflops}
+
+
+def report_full_model_stats(model, input_size):
+    """Total params of ProtoNet wrapper (backbone only, no extra params) + FLOPs."""
+    total_params = count_parameters(model)
+    trainable_params = count_parameters(model, trainable_only=True)
+    print(f"\n📊 ProtoNet full model: "
+          f"{total_params/1e6:.3f}M total params | "
+          f"{trainable_params/1e6:.3f}M trainable params")
+    flops_info = compute_flops(model.backbone, input_size=input_size)
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        **flops_info
+    }
+
+# ============================================
+# 3. DATA PREPARATION — CUB-200-2011 (من /kaggle/input مباشرة)
+# ============================================
+
+def _find_images_folder(root):
+    """أبسط وأوثق طريقة: يدوّر تحديدًا على مجلد اسمه 'images' (زي بنية
+    CUB_200_2011/images/ الرسمية) وفيه مجلدات فرعية (الأصناف)."""
+    for r, dirs, files in os.walk(root):
+        if os.path.basename(r) == "images" and any(
+            os.path.isdir(os.path.join(r, d)) for d in dirs
+        ):
+            return r
+    return None
+
+
+def _find_class_dirs(root):
+    """Return a directory whose immediate children are all class-folders
+    (heuristic: at least 50 subdirs, each containing images)."""
+    for r, dirs, files in os.walk(root):
+        if not dirs:
+            continue
+        sub_dirs = [d for d in dirs if os.path.isdir(os.path.join(r, d))]
+        if len(sub_dirs) < 50:  # CUB has 200 classes total / per split >=50
+            continue
+        sample = os.path.join(r, sub_dirs[0])
+        has_imgs = any(f.lower().endswith(('jpg', 'jpeg', 'png'))
+                       for f in os.listdir(sample))
+        if has_imgs:
+            return r
+    return None
+
+
+def _find_cub_dataset_root():
+    """يدوّر في /kaggle/input على داتاست CUB-200-2011 (متجاهلًا مجلدات فيها progress*.json)،
+    ولو ملقاهوش بينزّله بـ kagglehub (محتاج Internet)."""
+    if os.path.isdir(KAGGLE_INPUT_ROOT):
+        for entry in sorted(os.listdir(KAGGLE_INPUT_ROOT)):
+            entry_path = os.path.join(KAGGLE_INPUT_ROOT, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            if glob.glob(os.path.join(entry_path, "**", "progress*.json"), recursive=True):
+                continue  # Output نسخة سابقة، مش الداتاست
+            if _find_images_folder(entry_path) or _find_class_dirs(entry_path):
+                return entry_path
+        print("ℹ️  CUB مش موجود في /kaggle/input:", sorted(os.listdir(KAGGLE_INPUT_ROOT)))
+    print(f"📥 Downloading CUB-200-2011 via kagglehub ({CUB_KAGGLEHUB_ID})...")
+    try:
+        return kagglehub.dataset_download(CUB_KAGGLEHUB_ID)
+    except Exception as e:
+        raise RuntimeError(f"❌ مش لاقي داتاست CUB: ضيفه كـ Input (Add Input) أو فعّل Internet ({e}).")
+
+
+def _split_is_complete(split_root):
+    """🆕 يتأكد إن الثلاثة فولدرات train/val/test موجودين فعلًا وفيهم
+    أصناف (مش مجرد إن split_root نفسه موجود). بدون الفحص ده، لو حصل أي
+    قطع أو مشكلة ديسك في نص بناء الداتاست (مثلًا train وval خلصوا وtest
+    اتقطع)، الكود كان بيفتكر إن الداتاست 'جاهز' غلط ويكمّل بمجلد ناقص،
+    وده كان سبب FileNotFoundError على مجلد test وقت الـ Matched-Episode
+    Evaluation."""
+    for split_name in ("train", "val", "test"):
+        split_dir = os.path.join(split_root, split_name)
+        if not os.path.isdir(split_dir):
+            return False
+        class_dirs = [d for d in os.listdir(split_dir)
+                      if os.path.isdir(os.path.join(split_dir, d))]
+        if not class_dirs:
+            return False
+    return True
+
+
+def prepare_cub200():
+    if os.path.exists(CUB_SPLIT_ROOT):
+        if _split_is_complete(CUB_SPLIT_ROOT):
+            print("✅ CUB-200-2011 split already present and looks complete "
+                  "(train/val/test كلهم موجودين وفيهم أصناف).")
+            return
+        print("⚠️  لقينا مجلد split موجود لكنه ناقص (train/val/test مش كلهم "
+              "كاملين — غالبًا بسبب انقطاع سابق في منتصف البناء). "
+              "هنمسحه ونعيد بناء الداتاست بالكامل من تنزيل جديد.")
+        shutil.rmtree(CUB_SPLIT_ROOT)
+
+    print("\n🔍 بنجهّز داتاست CUB-200-2011...")
+    dataset_path = _find_cub_dataset_root()
+    if dataset_path is None:
+        raise RuntimeError(
+            "❌ مش لاقي داتاست CUB-200-2011."
+        )
+    print(f"📁 Dataset found at: {dataset_path}")
+
+    try:
+        os.makedirs(CUB_SPLIT_ROOT, exist_ok=True)
+
+        # الحالة 1: الداتاست موزّع بالفعل بمجلدات train/val/test رسمية
+        existing_splits = {}
+        for split_name in ["train", "val", "test"]:
+            for r, dirs, files in os.walk(dataset_path):
+                if os.path.basename(r).lower() == split_name and dirs:
+                    existing_splits[split_name] = r
+                    break
+
+        if len(existing_splits) == 3:
+            print("📦 Found official train/val/test split folders.")
+            for split_name, src_root in existing_splits.items():
+                dst_root = os.path.join(CUB_SPLIT_ROOT, split_name)
+                if not os.path.exists(dst_root):
+                    shutil.copytree(src_root, dst_root)
+            print("✅ CUB-200-2011 Data Structure Ready! (official split found)")
+            return
+
+        # الحالة 2: مجلد واحد فيه كل الأصناف (200 مجلد، زي CUB_200_2011/images/)
+        # → نعمل تقسيم يدوي class-disjoint: 100/50/50
+        images_root = _find_images_folder(dataset_path) or _find_class_dirs(dataset_path)
+        if images_root is None:
+            raise RuntimeError(
+                "Could not locate CUB-200-2011 class directories in dataset."
+            )
+
+        print(f"📁 Found images root: {images_root}")
+        classes = sorted([d for d in os.listdir(images_root)
+                           if os.path.isdir(os.path.join(images_root, d))])
+        print(f"📦 Found {len(classes)} classes.")
+
+        rng = random.Random(42)  # تقسيم ثابت وقابل لإعادة الإنتاج بين الجلسات —
+                                  # غيّر القيمة لو عايز تقسيم مختلف.
+        rng.shuffle(classes)
+        n_total = len(classes)
+        # نسبة قياسية لأبحاث Few-Shot على CUB: 100 train / 50 val / 50 test
+        # (لو عدد الأصناف الفعلي مختلف عن 200 بسبب اختلاف نسخة الداتاست، بنقسم
+        # بنفس النسبة تقريبًا: 50% / 25% / 25%)
+        if n_total == 200:
+            n_train, n_val = 100, 50
+        else:
+            n_train = int(round(n_total * 0.5))
+            n_val   = int(round(n_total * 0.25))
+        splits = {
+            "train": classes[:n_train],
+            "val":   classes[n_train:n_train + n_val],
+            "test":  classes[n_train + n_val:],
+        }
+        print(f"   Split sizes → train: {len(splits['train'])}, "
+              f"val: {len(splits['val'])}, test: {len(splits['test'])}")
+
+        for split_name, split_classes in splits.items():
+            os.makedirs(os.path.join(CUB_SPLIT_ROOT, split_name), exist_ok=True)
+            for c in split_classes:
+                src = os.path.join(images_root, c)
+                dst = os.path.join(CUB_SPLIT_ROOT, split_name, c)
+                if not os.path.exists(dst):
+                    shutil.copytree(src, dst)
+        print("✅ CUB-200-2011 Data Structure Ready! (class-disjoint split)")
+    except Exception as e:
+        print(f"❌ Error preparing CUB-200-2011: {e}")
+        raise
+
+
+with StageTimer("Stage 0: Data Preparation (CUB-200-2011)"):
+    prepare_cub200()
+
+# ============================================
+# 4. PROTOTYPE (Plain ProtoNet — no learnable norm, no gamma)
+# ============================================
+
+def compute_prototype(z_support):
+    """Class prototype = arithmetic mean of raw support embeddings."""
+    return z_support.mean(dim=0)
+
+# ============================================
+# 5. MODEL DEFINITION — MobileNetV3-LARGE
+# ============================================
+
+def get_mobilenet_finetuned(num_classes=100, supervised=True):
+    print(f"🔄 Loading MobileNetV3-SMALL pretrained (num_classes={num_classes})...")
+    weights = models.MobileNet_V3_Small_Weights.DEFAULT
+    model   = models.mobilenet_v3_small(weights=weights)
+
+    if supervised:
+        in_features = model.classifier[3].in_features
+        model.classifier[3] = nn.Linear(in_features, num_classes)
+    else:
+        model.classifier = nn.Identity()
+
+    return model
+
+
+def build_protonet_for_inference(checkpoint_path, num_classes=100):
+    base_model = get_mobilenet_finetuned(num_classes=num_classes, supervised=True)
+    base_model.classifier = nn.Identity()
+    model = MobileProtoNet(base_model)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model.to(device)
+    model.eval()
+    print(f"✅ Loaded checkpoint: {checkpoint_path}")
+    return model
+
+
+class MobileProtoNet(nn.Module):
+    """
+    Plain ProtoNet: prototype = mean of support embeddings,
+    logits = -squared_euclidean_distance(query, prototype).
+    لا يوجد LearnableNorm ولا gamma (بدون أي معاملات إضافية قابلة للتعلم
+    خارج الـ backbone نفسه).
+    """
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, support_x, query_x, n_way, k_shot):
+        x = torch.cat([support_x, query_x], dim=0)
+        x = self.backbone.features(x)
+        x = self.backbone.avgpool(x)
+        z = torch.flatten(x, 1)
+
+        z_support = z[:support_x.size(0)]
+        z_query   = z[support_x.size(0):]
+
+        z_proto = torch.stack([
+            compute_prototype(z_support[i * k_shot:(i + 1) * k_shot])
+            for i in range(n_way)
+        ])
+
+        # ProtoNet القياسي يستخدم مربع المسافة الإقليدية
+        dists = torch.cdist(z_query, z_proto) ** 2
+        logits = -dists
+        return logits
+
+# ============================================
+# 6. DATA LOADERS (parametrized by input_size)
+# ============================================
+
+def get_resize_dim(crop_dim):
+    return round(crop_dim * 256 / 224)
+
+
+def build_transforms(input_size):
+    resize_dim = get_resize_dim(input_size)
+
+    train_transform = transforms.Compose([
+        transforms.Resize((resize_dim, resize_dim)),
+        transforms.RandomCrop(input_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(0.4, 0.4, 0.4),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    test_transform = transforms.Compose([
+        transforms.Resize((resize_dim, resize_dim)),
+        transforms.CenterCrop(input_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return train_transform, test_transform
+
+
+
+# ===== CONTROL: 84 → 224 (upsampled) =====
+# نفس معلومات إدخال 84 بالظبط: resize 96 → crop 84 → bilinear upsample لـ 224.
+# مفيش أي تفاصيل زيادة عن 84؛ الشبكة بتشوف مقياس 224 بس.
+CTRL_NAME, CTRL_CROP, CTRL_SIZE = "84up224", 84, 224
+CTRL_RESIZE = round(CTRL_CROP * 256 / 224)   # = 96، نفس خط 84 الأصلي بالظبط
+_NORM = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+def build_transforms_ctrl():
+    up = transforms.Resize((CTRL_SIZE, CTRL_SIZE),
+                           interpolation=transforms.InterpolationMode.BILINEAR)
+    train_t = transforms.Compose([
+        transforms.Resize((CTRL_RESIZE, CTRL_RESIZE)),
+        transforms.RandomCrop(CTRL_CROP),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(0.4, 0.4, 0.4),
+        up, transforms.ToTensor(), _NORM,
+    ])
+    test_t = transforms.Compose([
+        transforms.Resize((CTRL_RESIZE, CTRL_RESIZE)),
+        transforms.CenterCrop(CTRL_CROP),
+        up, transforms.ToTensor(), _NORM,
+    ])
+    return train_t, test_t
+
+CUB_ROOT = CUB_SPLIT_ROOT
+
+# الحالات الثلاث: الاسم → (نوع الـ transform، حجم الإدخال الفعلي للشبكة)
+# 84b32 = نفس 84px بالظبط لكن batch 32 (بيعزل أثر الـ batch عن أثر المقياس)
+CONDITIONS = ["84px", "84b32", "84up224", "224px"]
+COND_INPUT = {"84px": 84, "84b32": 84, "84up224": 224, "224px": 224}
+COND_BATCH = {"84px": 64, "84b32": 32, "84up224": 32, "224px": 32}
+
+def build_transforms_cond(cond):
+    if cond == "84up224":
+        return build_transforms_ctrl()
+    return build_transforms(84 if cond in ("84px", "84b32") else 224)
+
+# حجم الدفعة لكل دقة (نفس قيم Small الأصلية: 84→64، 224→32). حالة 84up224 بتستخدم قيمة 224 (32)
+# لأنها بتدخل الشبكة بحجم 224 (ومحتاجة نفس إعداد 224 بالظبط).
+BATCH_SIZE_BY_RESOLUTION = {84: 64, 112: 48, 168: 32, 224: 32, 256: 16}
+
+
+class EpisodicSampler:
+    def __init__(self, root, transform):
+        self.root      = root
+        self.transform = transform
+        self.classes   = sorted(os.listdir(root))
+        self.data      = {}
+        for c in self.classes:
+            cls_path = os.path.join(root, c)
+            self.data[c] = [
+                os.path.join(cls_path, img)
+                for img in os.listdir(cls_path)
+                if img.lower().endswith(('jpg', 'jpeg', 'png'))
+            ]
+
+    def get_episode(self, n_way, k_shot, q_query):
+        selected_classes = random.sample(self.classes, n_way)
+        support_imgs, query_imgs, query_labels = [], [], []
+
+        for i, cls in enumerate(selected_classes):
+            available_imgs = self.data[cls]
+            needed = k_shot + q_query
+            if len(available_imgs) < needed:
+                sampled_paths = random.choices(available_imgs, k=needed)
+            else:
+                sampled_paths = random.sample(available_imgs, needed)
+
+            for path in sampled_paths[:k_shot]:
+                img = Image.open(path).convert('RGB')
+                support_imgs.append(self.transform(img))
+
+            for path in sampled_paths[k_shot:]:
+                img = Image.open(path).convert('RGB')
+                query_imgs.append(self.transform(img))
+                query_labels.append(i)
+
+        return (torch.stack(support_imgs),
+                torch.stack(query_imgs),
+                torch.tensor(query_labels))
+
+# ============================================
+# 6b. MATCHED-EPISODE EVALUATION (fixed episode set)
+# ============================================
+
+def generate_fixed_episodes(root, n_way, k_shot, q_query, n_episodes, seed):
+    rng = random.Random(seed)  # RNG محلي مستقل — لا يمس حالة random العامة
+    classes = sorted(os.listdir(root))
+    data = {}
+    for c in classes:
+        cls_path = os.path.join(root, c)
+        data[c] = [
+            os.path.join(cls_path, img)
+            for img in os.listdir(cls_path)
+            if img.lower().endswith(('jpg', 'jpeg', 'png'))
+        ]
+
+    episodes = []
+    for _ in range(n_episodes):
+        selected_classes = rng.sample(classes, n_way)
+        support_paths, query_paths, query_labels = [], [], []
+
+        for i, cls in enumerate(selected_classes):
+            available_imgs = data[cls]
+            needed = k_shot + q_query
+            if len(available_imgs) < needed:
+                sampled_paths = rng.choices(available_imgs, k=needed)
+            else:
+                sampled_paths = rng.sample(available_imgs, needed)
+
+            support_paths.extend(sampled_paths[:k_shot])
+            query_paths.extend(sampled_paths[k_shot:])
+            query_labels.extend([i] * q_query)
+
+        episodes.append({
+            "classes": selected_classes,
+            "support_paths": support_paths,
+            "query_paths": query_paths,
+            "query_labels": query_labels,
+        })
+
+    return episodes
+
+
+def _load_episode_tensors(episode_def, transform, n_way, k_shot):
+    support_imgs = [transform(Image.open(p).convert('RGB'))
+                     for p in episode_def["support_paths"]]
+    query_imgs   = [transform(Image.open(p).convert('RGB'))
+                     for p in episode_def["query_paths"]]
+    query_labels = torch.tensor(episode_def["query_labels"])
+    return torch.stack(support_imgs), torch.stack(query_imgs), query_labels
+
+
+@torch.no_grad()
+def evaluate_fixed_episodes(model, episode_defs, transform, n_way, k_shot, desc=""):
+    """يقيّم موديل على مجموعة episodes ثابتة (paths محددة سلفًا) ويرجّع
+    مصفوفة دقة لكل episode على حدة (بدون تجميع)، عشان تُستخدم في اختبار
+    paired لاحقًا."""
+    model.eval()
+    accs = []
+    for ep_def in tqdm(episode_defs, desc=f"Matched-Eval {desc}", leave=False):
+        sx, qx, qy = _load_episode_tensors(ep_def, transform, n_way, k_shot)
+        sx, qx, qy = sx.to(device), qx.to(device), qy.to(device)
+        logits = model(sx, qx, n_way, k_shot)
+        preds  = logits.argmax(dim=1)
+        accs.append((preds == qy).float().mean().item())
+    return np.array(accs)
+
+
+def paired_resolution_test(acc_84, acc_224, label=""):
+    """اختبار paired بين نفس الـ episodes بدقتين مختلفتين.
+    Δ_i = Acc224_i - Acc84_i ، H0: E[Δ] = 0."""
+    assert len(acc_84) == len(acc_224), "عدد الـ episodes لازم يتطابق للمقارنة الـ paired"
+    delta = acc_224 - acc_84
+    mean_delta = delta.mean()
+    std_delta  = delta.std(ddof=1)
+    n = len(delta)
+    se = std_delta / np.sqrt(n)
+    ci95 = 1.96 * se
+
+    t_stat, t_pval = scipy_stats.ttest_rel(acc_224, acc_84)
+    try:
+        w_stat, w_pval = scipy_stats.wilcoxon(acc_224, acc_84)
+    except ValueError:
+        # Wilcoxon بيفشل لو كل الفروق = صفر
+        w_stat, w_pval = float('nan'), float('nan')
+
+    print(f"\n📈 Paired 84x84 vs 224x224 — {label}")
+    print(f"   n episodes        : {n}")
+    print(f"   Mean Acc @84       : {acc_84.mean():.2%}")
+    print(f"   Mean Acc @224      : {acc_224.mean():.2%}")
+    print(f"   Mean Δ (224-84)    : {mean_delta:+.2%}  (95% CI ±{ci95:.2%})")
+    print(f"   Paired t-test      : t={t_stat:.4f}, p={t_pval:.6f}")
+    print(f"   Wilcoxon signed-rank: W={w_stat:.4f}, p={w_pval:.6f}")
+
+    return {
+        "n": n,
+        "mean_delta": mean_delta,
+        "ci95_delta": ci95,
+        "t_stat": t_stat,
+        "t_pval": t_pval,
+        "w_stat": w_stat,
+        "w_pval": w_pval,
+        "acc_84_mean": acc_84.mean(),
+        "acc_224_mean": acc_224.mean(),
+    }
+
+# ============================================
+# 7. EXECUTION STAGES
+# ============================================
+
+def stage1_finetuning(train_loader_simple, epochs=10, num_classes=100):
+    print(f"\n🦾 STAGE 1: Fine-tuning MobileNet on CUB-200-2011 for {epochs} epochs...")
+
+    model     = get_mobilenet_finetuned(num_classes=num_classes, supervised=True).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9,
+                                 nesterov=True, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss, correct, total = 0, 0, 0
+
+        pbar = tqdm(train_loader_simple, desc=f"Fine-tune Ep {epoch+1}", leave=False)
+        for imgs, labels in pbar:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss    = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            preds    = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total   += labels.size(0)
+            pbar.set_postfix({'Acc': f"{correct/total:.1%}"})
+
+        scheduler.step()
+        print(f"   Ep {epoch+1}: Loss {total_loss/len(train_loader_simple):.4f} | "
+              f"Train Acc {correct/total:.2%}")
+
+    print("✅ Fine-tuning Complete.")
+    return model
+
+
+def stage2_metatrain(pretrained_state_dict, train_sampler, val_sampler,
+                      n_way=5, k_shot=1, episodes=2000, num_classes=100,
+                      ckpt_path="best_mobile_proto_cub200.pth"):
+    print(f"\n🧠 STAGE 2: Meta-Training (ProtoNet) on CUB-200-2011 "
+          f"{n_way}-way {k_shot}-shot...")
+
+    base_model = get_mobilenet_finetuned(num_classes=num_classes, supervised=True)
+    base_model.load_state_dict(pretrained_state_dict)
+    base_model.classifier = nn.Identity()
+
+    model = MobileProtoNet(base_model).to(device)
+
+    # لا يوجد learnable_norm أو gamma الآن، لذلك مجموعة معاملات واحدة فقط للـ backbone
+    optimizer = torch.optim.Adam(model.backbone.parameters(), lr=1e-5)
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_acc = 0.0
+    patience     = 0
+
+    for ep in tqdm(range(episodes), desc="Meta-Train"):
+        sx, qx, qy = train_sampler.get_episode(n_way, k_shot, q_query=15)
+        sx, qx, qy = sx.to(device), qx.to(device), qy.to(device)
+
+        model.train()
+        optimizer.zero_grad()
+        logits = model(sx, qx, n_way, k_shot)
+        loss   = criterion(logits, qy)
+        loss.backward()
+        optimizer.step()
+
+        if (ep + 1) % 200 == 0:
+            val_acc, _ = evaluate(model, val_sampler, n_way, k_shot,
+                                   episodes=200, silent=True)
+            print(f"\n   Ep {ep+1}: Loss {loss.item():.4f} | Val Acc: {val_acc:.2%}")
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), ckpt_path)
+                patience = 0
+            else:
+                patience += 1
+                if patience > 10:
+                    print("⏹️ Early stopping triggered.")
+                    break
+
+    return model
+
+
+@torch.no_grad()
+def evaluate(model, sampler, n_way, k_shot, episodes=500, silent=False):
+    model.eval()
+    accs     = []
+    iterator = range(episodes) if silent else tqdm(range(episodes), desc="Evaluating")
+
+    for _ in iterator:
+        sx, qx, qy = sampler.get_episode(n_way, k_shot, q_query=15)
+        sx, qx, qy = sx.to(device), qx.to(device), qy.to(device)
+
+        logits = model(sx, qx, n_way, k_shot)
+        preds  = logits.argmax(dim=1)
+        accs.append((preds == qy).float().mean().item())
+
+    mean_acc = np.mean(accs)
+    ci95     = 1.96 * np.std(accs) / np.sqrt(episodes)
+
+    if not silent:
+        print(f"📊 Result: {mean_acc:.2%} ± {ci95:.2%}")
+
+    return mean_acc, ci95
+
+# ============================================
+# 8. RUN ONE FULL EXPERIMENT (given input_size + seed)
+# ============================================
+
+NUM_TRAIN_CLASSES = 100  # CUB-200-2011 few-shot train split size (100/50/50)
+
+def run_experiment(cond, seed, epochs=10, episodes=2000):
+    input_size = COND_INPUT[cond]
+    print("\n" + "#"*60)
+    print(f"### RUNNING EXPERIMENT: condition={cond} (network input {input_size}x{input_size}) | seed={seed}")
+    print("#"*60)
+
+    set_seed(seed)
+
+    train_transform, test_transform = build_transforms_cond(cond)
+
+    train_dataset_simple = datasets.ImageFolder(
+        root=os.path.join(CUB_ROOT, "train"),
+        transform=train_transform
+    )
+    batch_size = COND_BATCH[cond]
+    train_loader_simple = DataLoader(
+        train_dataset_simple,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+    print(f"   Batch size: {batch_size}")
+
+    train_sampler = EpisodicSampler(os.path.join(CUB_ROOT, "train"), test_transform)
+    val_sampler   = EpisodicSampler(os.path.join(CUB_ROOT, "val"),   test_transform)
+    test_sampler  = EpisodicSampler(os.path.join(CUB_ROOT, "test"),  test_transform)
+
+    tag = f"{cond}_seed{seed}"
+
+    # ── Stage 1 ──────────────────────────────
+    backbone_ckpt = os.path.join(WORK_ROOT, f"backbone_cub200_small_{tag}.pth")
+    if not os.path.exists(backbone_ckpt):
+        with StageTimer(f"Stage 1: Fine-Tuning ({tag})"):
+            ft_model = stage1_finetuning(train_loader_simple, epochs=epochs,
+                                          num_classes=NUM_TRAIN_CLASSES)
+            torch.save(ft_model.state_dict(), backbone_ckpt)
+    else:
+        print(f"✅ Backbone checkpoint found for {tag} (من تشغيلة سابقة لنفس الكود). Skipping Stage 1.")
+    pretrained_state_dict = torch.load(backbone_ckpt, map_location=device)
+
+    results = {}
+
+    for k_shot in [1, 5]:
+        print("\n" + "="*40)
+        print(f"🎯 TASK: 5-way {k_shot}-shot ({tag})")
+        print("="*40)
+
+        ckpt_path = os.path.join(
+            WORK_ROOT, f"best_mobile_proto_cub200_small_{tag}_{k_shot}shot.pth"
+        )
+
+        with StageTimer(f"Stage 2: Meta-Training {k_shot}-shot ({tag})"):
+            stage2_metatrain(pretrained_state_dict, train_sampler, val_sampler,
+                              n_way=5, k_shot=k_shot, episodes=episodes,
+                              num_classes=NUM_TRAIN_CLASSES, ckpt_path=ckpt_path)
+
+        with StageTimer(f"Stage 3: Test Evaluation {k_shot}-shot ({tag})"):
+            best_model = build_protonet_for_inference(
+                checkpoint_path=ckpt_path, num_classes=NUM_TRAIN_CLASSES
+            )
+            mean_acc, ci95 = evaluate(best_model, test_sampler, n_way=5, k_shot=k_shot)
+            results[k_shot] = {"mean_acc": mean_acc, "ci95": ci95, "ckpt_path": ckpt_path}
+
+        if k_shot == 5:
+            print("\n" + "="*40)
+            print(f"📐 MODEL SIZE & COMPUTE REPORT ({tag})")
+            print("="*40)
+            report_full_model_stats(best_model, input_size=input_size)
+
+    return results
+
+# ============================================
+# 8b. RESUME / PROGRESS TRACKING
+# ============================================
+# ملف تقدّم بيتحدّث بعد كل (input_size, seed, k_shot) يخلص — لو التجربة
+# اتقطعت (انقطع النت، قفلت الجلسة، ...) وشغّلت الكود تاني (بعد ما تضيف
+# الـ Output بتاع النسخة المحفوظة كـ Input زي ما اتشرح فوق)، هيقرأ الملف
+# ده ويكمّل من عند آخر حاجة خلصها، من غير ما يعيد أي تدريب أو تقييم اتعمل
+# قبل كده. الحفظ atomic (كتابة لملف مؤقت ثم rename) عشان لو الجلسة اتقفلت
+# في نص الكتابة، الملف الأصلي يفضل سليم.
+
+PROGRESS_FILE = os.path.join(WORK_ROOT, PROGRESS_NAME)
+
+
+def load_progress():
+    """{"results": {cond: {seed: {k: {...}}}}, "matched": {k: {seed: {cond: [acc per episode]}}}}"""
+    if not os.path.exists(PROGRESS_FILE):
+        return {"results": {}, "matched": {}}
+    try:
+        with open(PROGRESS_FILE) as f:
+            d = json.load(f)
+        d.setdefault("results", {}); d.setdefault("matched", {})
+        print(f"♻️  لقينا تقدّم سابق في {PROGRESS_FILE}: "
+              f"{ {c: sorted(v.keys()) for c, v in d['results'].items()} }")
+        return d
+    except Exception as e:
+        print(f"⚠️  ملف التقدّم تالف ({e}) — هنبدأ من الصفر.")
+        return {"results": {}, "matched": {}}
+
+
+def save_progress(d):
+    tmp = PROGRESS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, PROGRESS_FILE)
+    print(f"💾 اتحفظ {PROGRESS_FILE}")
+
+# ============================================
+# 8c. AUTO-PUSH TO GITHUB (بديل تلقائي للتنزيل اليدوي)
+# ============================================
+# بعد كل seed، بنعمل push لكل محتوى WORK_ROOT (progress.json + كل الـ
+# checkpoints) لمستودع GitHub بتاعك. لو فشل لأي سبب، بنطبع تحذير ونكمّل
+# التدريب عادي — الفشل هنا مايوقفش التجربة خالص.
+
+_github_push_warned_once = False
+
+# ملحوظة: _run_git_cmd معرّفة فوق في قسم 0 (PATHS) عشان تُستخدم في
+# الاسترجاع التلقائي من GitHub قبل بداية التدريب، وبنعيد استخدامها هنا.
+
+
+def push_results_to_github(commit_message="Update results"):
+    """🆕 يعمل push تلقائي لملفات WORK_ROOT (progress.json + checkpoints)
+    لمستودع GitHub محدد في GITHUB_REPO. أي فشل هنا بيتحول لتحذير فقط —
+    مايوقفش التدريب خالص."""
+    global _github_push_warned_once
+
+    if GITHUB_REPO.startswith("your-username/"):
+        if not _github_push_warned_once:
+            print("ℹ️  GITHUB_REPO لسه مش معدّل (لسه على القيمة الافتراضية) — "
+                  "هنتجاهل GitHub Auto-Push. غيّر GITHUB_REPO في بداية الكود "
+                  "لو عايز تفعّل الخاصية دي.")
+            _github_push_warned_once = True
+        return False
+
+    try:
+        import subprocess as _sp  # noqa: F401 (تأكيد إنه متاح هنا)
+    except ImportError:
+        pass
+
+    token = _get_github_token()
+    if not token:
+        print("⚠️  مقدرتش أجيب GITHUB_TOKEN من Kaggle Secrets. ضيفه من Add-ons → "
+              "Secrets باسم GITHUB_TOKEN وفعّل Internet. هنتجاهل GitHub Auto-Push المرة دي.")
+        return False
+
+    remote_url = f"https://{token}@github.com/{GITHUB_REPO}.git"
+
+    try:
+        # Clone لو أول مرة، وإلا pull عادي
+        if not os.path.exists(os.path.join(GITHUB_CLONE_DIR, ".git")):
+            print(f"\n📥 بنعمل clone لأول مرة لمستودع النتائج ({GITHUB_REPO})...")
+            ok, out = _run_git_cmd([
+                "clone", "--depth", "1", "--branch", GITHUB_BRANCH,
+                remote_url, GITHUB_CLONE_DIR
+            ])
+            if not ok:
+                # ممكن يكون البranch مش موجود لسه (مستودع فاضي) → نعمل init بدالها
+                print("ℹ️  الـ clone فشل (غالبًا المستودع فاضي لسه) — هنعمل init محلي بدل كده.")
+                os.makedirs(GITHUB_CLONE_DIR, exist_ok=True)
+                _run_git_cmd(["init"], cwd=GITHUB_CLONE_DIR)
+                _run_git_cmd(["checkout", "-b", GITHUB_BRANCH], cwd=GITHUB_CLONE_DIR)
+                _run_git_cmd(["remote", "add", "origin", remote_url], cwd=GITHUB_CLONE_DIR)
+        else:
+            ok, out = _run_git_cmd(["pull", "--rebase", "origin", GITHUB_BRANCH],
+                                    cwd=GITHUB_CLONE_DIR)
+            if not ok:
+                print(f"⚠️  git pull فشل (هنكمّل ونحاول الـ push عادي):\n{out}")
+
+        _run_git_cmd(["config", "user.email", "kaggle-bot@example.com"], cwd=GITHUB_CLONE_DIR)
+        _run_git_cmd(["config", "user.name", "Kaggle Auto-Push"], cwd=GITHUB_CLONE_DIR)
+
+        # ننسخ كل محتوى WORK_ROOT لمجلد فرعي جوه المستودع
+        dst_dir = os.path.join(GITHUB_CLONE_DIR, GITHUB_SUBFOLDER)
+        os.makedirs(dst_dir, exist_ok=True)
+        for item in os.listdir(WORK_ROOT):
+            src_path = os.path.join(WORK_ROOT, item)
+            dst_path = os.path.join(dst_dir, item)
+            if os.path.isfile(src_path):
+                if os.path.getsize(src_path) > 95 * 1024 * 1024:
+                    print(f"⚠️  تخطّي {item} (أكبر من 95MB — حد GitHub 100MB)")
+                    continue
+                shutil.copy2(src_path, dst_path)
+
+        ok, out = _run_git_cmd(["add", "-A"], cwd=GITHUB_CLONE_DIR)
+        ok, out = _run_git_cmd(["commit", "-m", commit_message], cwd=GITHUB_CLONE_DIR)
+        if not ok and "nothing to commit" not in out.lower():
+            print(f"⚠️  git commit فشل:\n{out}")
+            return False
+
+        ok, out = _run_git_cmd(
+            ["push", "-u", "origin", f"HEAD:{GITHUB_BRANCH}"],
+            cwd=GITHUB_CLONE_DIR,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        )
+        if not ok:
+            print(f"⚠️  git push فشل (هنكمّل التدريب عادي، الملفات لسه محفوظة "
+                  f"محليًا في /kaggle/working):\n{out}")
+            return False
+
+        print(f"🚀 اتعمل push ناجح للمستودع {GITHUB_REPO} (فرع {GITHUB_BRANCH}) — "
+              f"الملفات دلوقتي متاحة على GitHub.")
+        return True
+
+    except Exception as e:
+        print(f"⚠️  GitHub Auto-Push فشل بشكل غير متوقع ({e}) — هنكمّل التدريب عادي.")
+        return False
+
+
+
+# ============================================
+# 9. MAIN — 4-WAY: 84 / 84b32 / 84→224 / 224 (كلهم بيتدرّبوا هنا)
+# ============================================
+
+def paired_compare(a, b, name_a, name_b, label):
+    """Δ = b − a على نفس الـ episodes."""
+    d = b - a
+    n = len(d)
+    ci = 1.96 * d.std(ddof=1) / np.sqrt(n)
+    t, tp = scipy_stats.ttest_rel(b, a)
+    try:
+        w, wp = scipy_stats.wilcoxon(b, a)
+    except ValueError:
+        w, wp = float("nan"), float("nan")
+    print(f"   {name_b:>8s} − {name_a:<8s}: Δ={d.mean():+.2%} (±{ci:.2%}) | "
+          f"t-test p={tp:.2e} | Wilcoxon p={wp:.2e}   [{label}]")
+    return d.mean()
+
+
+if __name__ == "__main__":
+    SEEDS   = [1,2,3]   # seed واحد الأول؛ زوّد [1, 2, 3] بعد كده (بيكمّل من progress_3way.json)
+    N_WAY   = 5
+    Q_QUERY = 15
+    N_MATCHED_EPISODES = 2000
+    MATCHED_EPISODES_SEED = 999
+
+    P = load_progress()
+
+    # ── تدريب الحالات الثلاث (Stage 1 + Stage 2) لكل seed ──
+    for seed in SEEDS:
+        for cond in CONDITIONS:
+            done = P["results"].get(cond, {}).get(str(seed), {})
+            if "1" in done and "5" in done:
+                print(f"✅ {cond} seed={seed} متدرّب بالفعل (من تشغيلة سابقة لنفس الكود) — تخطّي.")
+                continue
+            res = run_experiment(cond, seed, epochs=10, episodes=2000)
+            P["results"].setdefault(cond, {})[str(seed)] = {
+                str(k): {"mean_acc": float(v["mean_acc"]), "ci95": float(v["ci95"]),
+                         "ckpt_path": v["ckpt_path"]} for k, v in res.items()}
+            save_progress(P)
+            push_results_to_github(commit_message=f"3way: {cond} seed={seed} trained")
+
+    # ── Matched-episode eval: نفس الـ 2000 episodes للحالات الثلاث ──
+    with StageTimer("Matched-Episode Generation"):
+        fixed_episodes = {
+            k: generate_fixed_episodes(root=os.path.join(CUB_ROOT, "test"), n_way=N_WAY, k_shot=k,
+                                        q_query=Q_QUERY, n_episodes=N_MATCHED_EPISODES,
+                                        seed=MATCHED_EPISODES_SEED)
+            for k in [1, 5]
+        }
+    test_tf = {c: build_transforms_cond(c)[1] for c in CONDITIONS}
+
+    for k in [1, 5]:
+        for seed in SEEDS:
+            m = P["matched"].setdefault(str(k), {}).setdefault(str(seed), {})
+            for cond in CONDITIONS:
+                if cond in m:
+                    continue
+                ckpt = P["results"][cond][str(seed)][str(k)]["ckpt_path"]
+                if not os.path.exists(ckpt):
+                    ckpt = os.path.join(WORK_ROOT, os.path.basename(ckpt))
+                model = build_protonet_for_inference(ckpt, num_classes=NUM_TRAIN_CLASSES)
+                accs = evaluate_fixed_episodes(model, fixed_episodes[k], test_tf[cond], N_WAY, k,
+                                                desc=f"{cond} seed{seed} {k}shot")
+                m[cond] = accs.tolist()
+                save_progress(P)
+            push_results_to_github(commit_message=f"3way: matched {k}-shot seed={seed}")
+
+    # ── التحليل ──
+    print("\n" + "=" * 70)
+    print("🧪 4-WAY RESULTS: 84 vs 84b32 vs 84→224 (upsampled) vs 224 — all trained fresh")
+    print("=" * 70)
+    for k in [1, 5]:
+        print(f"\n── {k}-shot ──")
+        arr = {c: [np.array(P["matched"][str(k)][str(sd)][c]) for sd in SEEDS] for c in CONDITIONS}
+        for c in CONDITIONS:
+            per_seed = [a.mean() for a in arr[c]]
+            rnd = [P["results"][c][str(sd)][str(k)]["mean_acc"] for sd in SEEDS]
+            print(f"   {c:8s}: matched {np.mean(per_seed):.2%} ± {np.std(per_seed):.2%} | "
+                  f"random-episodes eval {np.mean(rnd):.2%}   (per seed matched: {[f'{a:.2%}' for a in per_seed]})")
+        p84, pb32, pct, p224 = (np.concatenate(arr[c]) for c in CONDITIONS)
+        print(f"   Paired tests (pooled {len(SEEDS)} seed(s) × {N_MATCHED_EPISODES} episodes):")
+        total  = paired_compare(p84, p224, "84", "224", "total effect")
+        scale  = paired_compare(p84, pct,  "84", "84up224", "(b) scale/format only, no new detail")
+        detail = paired_compare(pct, p224, "84up224", "224", "(a) extra visual detail")
+        print(f"   Decomposition: total {total:+.2%} = scale {scale:+.2%} + extra detail {detail:+.2%}")
+        print("   ── عزل أثر الـ batch (84b32 = 84 بـ batch 32) ──")
+        batch_eff = paired_compare(p84, pb32, "84", "84b32", "batch effect alone (64→32, same 84 input)")
+        scale_b32 = paired_compare(pb32, pct, "84b32", "84up224", "scale effect, SAME batch 32")
+        print(f"   Same-batch view: 84b32→84up224 (scale, batch fixed) {scale_b32:+.2%} | "
+              f"84up224→224 (detail) {detail:+.2%} | batch alone {batch_eff:+.2%}")
+
+    print("\n📖 التفسير:")
+    print("  • 84up224 ≈ 224  والفرق بينهم غير معنوي → المكسب مصدره مقياس 224 (تفسير ب).")
+    print("  • 84up224 ≈ 84   والفرق مع 224 كبير       → المكسب مصدره التفاصيل البصرية (تفسير أ).")
+    print("  • بينهم → الاتنين مساهمين؛ استخدم الـ decomposition فوق بالأرقام.")
+    print_stage_time_summary()
